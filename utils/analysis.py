@@ -1,11 +1,13 @@
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from statsmodels.tsa.stattools import adfuller
+import streamlit as st
 
 # Try to import Prophet but provide fallback if not available
 try:
@@ -13,10 +15,10 @@ try:
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
-    print("Warning: Prophet not available. Using other models as fallback.")
+    st.warning("Prophet not available. Using other models as fallback.")
 
 def generate_forecast(series, forecast_period, freq='M', model_type='SARIMAX', confidence_level=95):
-    """Generate forecast using SARIMAX as ARIMA replacement"""
+    """Generate forecast using selected model"""
     try:
         # Basic validation
         if len(series) < 12:
@@ -29,20 +31,17 @@ def generate_forecast(series, forecast_period, freq='M', model_type='SARIMAX', c
         seasonal_periods = 12 if freq in ['M', 'MS'] else 4 if freq in ['Q', 'QS'] else 1
         has_seasonality = len(series) > 2 * seasonal_periods
 
-        # Model selection
+        # Model implementation
         if model_type == 'SARIMAX':
-            # SARIMAX configuration (1,1,1)x(1,1,1,12) as default
             if has_seasonality:
                 model = SARIMAX(series,
                               order=(1,1,1),
                               seasonal_order=(1,1,1,seasonal_periods),
-                              enforce_stationarity=False,
-                              enforce_invertibility=False)
+                              enforce_stationarity=False)
             else:
                 model = SARIMAX(series,
                               order=(1,1,1),
-                              enforce_stationarity=False,
-                              enforce_invertibility=False)
+                              enforce_stationarity=False)
             
             fitted_model = model.fit(disp=False)
             forecast = fitted_model.get_forecast(steps=forecast_period)
@@ -68,28 +67,19 @@ def generate_forecast(series, forecast_period, freq='M', model_type='SARIMAX', c
             
         else:  # Exponential Smoothing fallback
             if model_type == 'Prophet' and not PROPHET_AVAILABLE:
-                print("Warning: Prophet not available, using Exponential Smoothing")
+                st.warning("Prophet not available, using Exponential Smoothing")
                 
-            if has_seasonality:
-                model = ExponentialSmoothing(
-                    series,
-                    trend='add',
-                    seasonal='add',
-                    seasonal_periods=seasonal_periods,
-                    damped_trend=True
-                ).fit()
-            else:
-                model = ExponentialSmoothing(
-                    series,
-                    trend='add',
-                    seasonal=None,
-                    damped_trend=True
-                ).fit()
+            model = ExponentialSmoothing(
+                series,
+                trend='add',
+                seasonal='add' if has_seasonality else None,
+                seasonal_periods=seasonal_periods if has_seasonality else None
+            ).fit()
             forecast_values = model.forecast(forecast_period)
             
             # Calculate confidence intervals
             std_error = np.std(series - model.fittedvalues)
-            z_score = {'95': 1.96, '90': 1.645, '80': 1.28}.get(str(confidence_level), 1.96
+            z_score = {'95': 1.96, '90': 1.645, '80': 1.28}.get(str(confidence_level), 1.96)
             lower = forecast_values - z_score * std_error
             upper = forecast_values + z_score * std_error
 
@@ -101,21 +91,16 @@ def generate_forecast(series, forecast_period, freq='M', model_type='SARIMAX', c
             if model_type == 'SARIMAX':
                 val_model = SARIMAX(train,
                                   order=(1,1,1),
-                                  seasonal_order=(1,1,1,seasonal_periods) if has_seasonality else (0,0,0,0),
-                                  enforce_stationarity=False)
+                                  seasonal_order=(1,1,1,seasonal_periods) if has_seasonality else (0,0,0,0))
                 val_fitted = val_model.fit(disp=False)
-                val_forecast = val_fitted.get_forecast(steps=len(test))
-                val_pred = val_forecast.predicted_mean
+                val_pred = val_fitted.get_forecast(steps=len(test)).predicted_mean
                 
             elif model_type == 'Prophet' and PROPHET_AVAILABLE:
-                val_prophet_df = pd.DataFrame({
-                    'ds': train.index,
-                    'y': train.values
-                })
                 val_model = Prophet(yearly_seasonality=has_seasonality)
-                val_model.fit(val_prophet_df)
-                val_future = val_model.make_future_dataframe(periods=len(test), freq=freq)
-                val_pred = val_model.predict(val_future)['yhat'][-len(test):].values
+                val_model.fit(pd.DataFrame({'ds': train.index, 'y': train.values}))
+                val_pred = val_model.predict(
+                    val_model.make_future_dataframe(periods=len(test), freq=freq)
+                )['yhat'][-len(test):].values
                 
             else:
                 val_model = ExponentialSmoothing(
@@ -132,7 +117,7 @@ def generate_forecast(series, forecast_period, freq='M', model_type='SARIMAX', c
             r2 = r2_score(test, val_pred)
             
         except Exception as e:
-            print(f"Validation error: {str(e)}")
+            st.warning(f"Validation error: {str(e)}")
             mae, rmse, r2 = None, None, None
         
         return {
@@ -142,11 +127,11 @@ def generate_forecast(series, forecast_period, freq='M', model_type='SARIMAX', c
             'mae': mae,
             'rmse': rmse,
             'r2': r2,
-            'model_used': 'Prophet' if model_type == 'Prophet' and PROPHET_AVAILABLE else model_type
+            'model_used': model_type
         }
         
     except Exception as e:
-        print(f"Forecast error: {str(e)}")
+        st.error(f"Forecast error: {str(e)}")
         return None
 
 def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type='SARIMAX', confidence_interval=95):
@@ -156,17 +141,7 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
         'std': None,
         'trend': None,
         'has_seasonality': False,
-        'stationarity': {
-            'test_statistic': None,
-            'p_value': None,
-            'critical_values': {
-                '1%': None,
-                '5%': None,
-                '10%': None
-            },
-            'is_stationary': None,
-            'error': None
-        },
+        'stationarity': None,
         'decomposition_fig': None,
         'forecast_fig': None,
         'diagnostics_fig': None,
@@ -193,20 +168,14 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
         # Stationarity test
         try:
             adf_result = adfuller(series.dropna())
-            if len(adf_result) >= 5:
-                results['stationarity'].update({
-                    'test_statistic': adf_result[0],
-                    'p_value': adf_result[1],
-                    'critical_values': {
-                        '1%': adf_result[4]['1%'],
-                        '5%': adf_result[4]['5%'],
-                        '10%': adf_result[4]['10%']
-                    },
-                    'is_stationary': adf_result[1] <= 0.05,
-                    'error': None
-                })
+            results['stationarity'] = {
+                'test_statistic': adf_result[0],
+                'p_value': adf_result[1],
+                'critical_values': adf_result[4],
+                'is_stationary': adf_result[1] <= 0.05
+            }
         except Exception as e:
-            results['stationarity']['error'] = f"Stationarity test error: {str(e)}"
+            st.warning(f"Stationarity test error: {str(e)}")
         
         # Seasonal decomposition
         if len(series) >= 24:
@@ -219,25 +188,16 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                 seasonal_ratio = decomposition.seasonal.std() / decomposition.observed.std()
                 results['has_seasonality'] = seasonal_ratio > 0.1
                 
-                # Decomposition plot
-                decomp_df = pd.DataFrame({
-                    'Observed': decomposition.observed,
-                    'Trend': decomposition.trend,
-                    'Seasonal': decomposition.seasonal,
-                    'Residual': decomposition.resid
-                }).reset_index()
+                # Create decomposition plot
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df[date_col], y=decomposition.observed, name='Observed'))
+                fig.add_trace(go.Scatter(x=df[date_col], y=decomposition.trend, name='Trend'))
+                fig.add_trace(go.Scatter(x=df[date_col], y=decomposition.seasonal, name='Seasonal'))
+                fig.add_trace(go.Scatter(x=df[date_col], y=decomposition.resid, name='Residual'))
+                results['decomposition_fig'] = fig
                 
-                results['decomposition_fig'] = px.line(
-                    decomp_df.melt(id_vars=[date_col], var_name='Component'),
-                    x=date_col,
-                    y='value',
-                    color='Component',
-                    facet_row='Component',
-                    height=800,
-                    title="Time Series Decomposition"
-                )
             except Exception as e:
-                print(f"Decomposition error: {str(e)}")
+                st.warning(f"Decomposition error: {str(e)}")
         
         # Forecasting
         forecast_result = generate_forecast(
@@ -256,7 +216,7 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                 'model_used': forecast_result['model_used']
             })
             
-            # Forecast plot data
+            # Prepare forecast data
             last_date = df[date_col].iloc[-1]
             future_dates = pd.date_range(
                 start=last_date,
@@ -268,54 +228,38 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                 date_col: future_dates,
                 value_col: forecast_result['forecast'],
                 'lower': forecast_result['lower'],
-                'upper': forecast_result['upper'],
-                'type': 'Forecast'
+                'upper': forecast_result['upper']
             })
-            
             results['forecast_df'] = forecast_df
             
             # Create forecast plot
-            original_df = df[[date_col, value_col]].copy()
-            original_df['type'] = 'Historical'
-            
-            fig = px.line(
-                original_df,
-                x=date_col,
-                y=value_col,
-                color='type',
-                title=f"Time Series Forecast ({forecast_result['model_used']})"
-            )
-            
+            fig = px.line(df, x=date_col, y=value_col, title="Historical Data")
             fig.add_scatter(
                 x=forecast_df[date_col],
                 y=forecast_df[value_col],
                 mode='lines',
                 name='Forecast',
-                line=dict(dash='dot', color='red')
+                line=dict(color='red', dash='dot')
             )
-            
-            if forecast_result['lower'] is not None:
-                fig.add_scatter(
-                    x=forecast_df[date_col],
-                    y=forecast_df['lower'],
-                    mode='lines',
-                    line=dict(width=0),
-                    showlegend=False
-                )
-                
-                fig.add_scatter(
-                    x=forecast_df[date_col],
-                    y=forecast_df['upper'],
-                    mode='lines',
-                    line=dict(width=0),
-                    fill='tonexty',
-                    fillcolor='rgba(255,0,0,0.2)',
-                    name=f'{confidence_interval}% Confidence'
-                )
-            
+            fig.add_scatter(
+                x=forecast_df[date_col],
+                y=forecast_df['lower'],
+                mode='lines',
+                line=dict(width=0),
+                showlegend=False
+            )
+            fig.add_scatter(
+                x=forecast_df[date_col],
+                y=forecast_df['upper'],
+                mode='lines',
+                line=dict(width=0),
+                fill='tonexty',
+                fillcolor='rgba(255,0,0,0.2)',
+                name=f'{confidence_interval}% CI'
+            )
             results['forecast_fig'] = fig
     
     except Exception as e:
-        print(f"Analysis error: {str(e)}")
+        st.error(f"Analysis error: {str(e)}")
     
     return results
