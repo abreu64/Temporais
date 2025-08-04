@@ -161,10 +161,10 @@ with st.sidebar:
         
         # Model selection
         model_type = st.selectbox(
-            "Forecasting Model",
-            options=["AutoARIMA", "Prophet", "ExponentialSmoothing", "LSTM"],
+            "Modelo de Previsão",
+            options=["SARIMAX", "Prophet", "Exponencial"],
             index=0,
-            help="Select forecasting model to use"
+            help="Selecione o modelo de previsão"
         )
         
         # Date filter

@@ -3,7 +3,7 @@ import numpy as np
 import plotly.express as px
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from statsmodels.tsa.stattools import adfuller
 
@@ -13,32 +13,43 @@ try:
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
-    print("Warning: Prophet não disponível. Usando outros modelos como fallback.")
+    print("Warning: Prophet not available. Using other models as fallback.")
 
-def generate_forecast(series, forecast_period, freq='M', model_type='AutoARIMA', confidence_level=95):
-    """Gera previsão robusta com tratamento de erros e múltiplos modelos"""
+def generate_forecast(series, forecast_period, freq='M', model_type='SARIMAX', confidence_level=95):
+    """Generate forecast using SARIMAX as ARIMA replacement"""
     try:
-        # Verificação básica de dados
+        # Basic validation
         if len(series) < 12:
-            raise ValueError("Dados insuficientes (mínimo 12 períodos)")
+            raise ValueError("Insufficient data (minimum 12 periods required)")
         
         if series.isnull().any():
             series = series.interpolate()
-        
-        # Configuração sazonal
+
+        # Seasonal configuration
         seasonal_periods = 12 if freq in ['M', 'MS'] else 4 if freq in ['Q', 'QS'] else 1
         has_seasonality = len(series) > 2 * seasonal_periods
-        
-        # Seleção do modelo
-        if model_type == 'AutoARIMA':
+
+        # Model selection
+        if model_type == 'SARIMAX':
+            # SARIMAX configuration (1,1,1)x(1,1,1,12) as default
             if has_seasonality:
-                model = ARIMA(series, order=(1,1,1), seasonal_order=(1,1,1,12))
+                model = SARIMAX(series,
+                              order=(1,1,1),
+                              seasonal_order=(1,1,1,seasonal_periods),
+                              enforce_stationarity=False,
+                              enforce_invertibility=False)
             else:
-                model = ARIMA(series, order=(1,1,1))
-            fitted_model = model.fit()
-            forecast = fitted_model.forecast(steps=forecast_period)
-            lower, upper = None, None
+                model = SARIMAX(series,
+                              order=(1,1,1),
+                              enforce_stationarity=False,
+                              enforce_invertibility=False)
             
+            fitted_model = model.fit(disp=False)
+            forecast = fitted_model.get_forecast(steps=forecast_period)
+            forecast_values = forecast.predicted_mean
+            conf_int = forecast.conf_int(alpha=1-confidence_level/100)
+            lower, upper = conf_int.iloc[:,0], conf_int.iloc[:,1]
+
         elif model_type == 'Prophet' and PROPHET_AVAILABLE:
             prophet_df = pd.DataFrame({
                 'ds': series.index,
@@ -51,13 +62,13 @@ def generate_forecast(series, forecast_period, freq='M', model_type='AutoARIMA',
             model.fit(prophet_df)
             future = model.make_future_dataframe(periods=forecast_period, freq=freq)
             forecast_df = model.predict(future)
-            forecast = forecast_df['yhat'][-forecast_period:].values
+            forecast_values = forecast_df['yhat'][-forecast_period:].values
             lower = forecast_df['yhat_lower'][-forecast_period:].values
             upper = forecast_df['yhat_upper'][-forecast_period:].values
             
-        else:  # Exponential Smoothing (padrão)
+        else:  # Exponential Smoothing fallback
             if model_type == 'Prophet' and not PROPHET_AVAILABLE:
-                print("Aviso: Prophet não disponível, usando Exponential Smoothing como alternativa")
+                print("Warning: Prophet not available, using Exponential Smoothing")
                 
             if has_seasonality:
                 model = ExponentialSmoothing(
@@ -74,21 +85,27 @@ def generate_forecast(series, forecast_period, freq='M', model_type='AutoARIMA',
                     seasonal=None,
                     damped_trend=True
                 ).fit()
-            forecast = model.forecast(forecast_period)
-            lower, upper = None, None
-        
-        # Validação cruzada para métricas
+            forecast_values = model.forecast(forecast_period)
+            
+            # Calculate confidence intervals
+            std_error = np.std(series - model.fittedvalues)
+            z_score = {'95': 1.96, '90': 1.645, '80': 1.28}.get(str(confidence_level), 1.96
+            lower = forecast_values - z_score * std_error
+            upper = forecast_values + z_score * std_error
+
+        # Cross-validation for metrics
         train_size = max(int(len(series) * 0.8), 12)
         train, test = series[:train_size], series[train_size:]
         
         try:
-            if model_type == 'AutoARIMA':
-                if has_seasonality:
-                    val_model = ARIMA(train, order=(1,1,1), seasonal_order=(1,1,1,12))
-                else:
-                    val_model = ARIMA(train, order=(1,1,1))
-                val_fitted = val_model.fit()
-                val_forecast = val_fitted.forecast(steps=len(test))
+            if model_type == 'SARIMAX':
+                val_model = SARIMAX(train,
+                                  order=(1,1,1),
+                                  seasonal_order=(1,1,1,seasonal_periods) if has_seasonality else (0,0,0,0),
+                                  enforce_stationarity=False)
+                val_fitted = val_model.fit(disp=False)
+                val_forecast = val_fitted.get_forecast(steps=len(test))
+                val_pred = val_forecast.predicted_mean
                 
             elif model_type == 'Prophet' and PROPHET_AVAILABLE:
                 val_prophet_df = pd.DataFrame({
@@ -98,7 +115,7 @@ def generate_forecast(series, forecast_period, freq='M', model_type='AutoARIMA',
                 val_model = Prophet(yearly_seasonality=has_seasonality)
                 val_model.fit(val_prophet_df)
                 val_future = val_model.make_future_dataframe(periods=len(test), freq=freq)
-                val_forecast = val_model.predict(val_future)['yhat'][-len(test):].values
+                val_pred = val_model.predict(val_future)['yhat'][-len(test):].values
                 
             else:
                 val_model = ExponentialSmoothing(
@@ -107,27 +124,19 @@ def generate_forecast(series, forecast_period, freq='M', model_type='AutoARIMA',
                     seasonal='add' if has_seasonality else None,
                     seasonal_periods=seasonal_periods if has_seasonality else None
                 ).fit()
-                val_forecast = val_model.forecast(len(test))
+                val_pred = val_model.forecast(len(test))
             
-            # Cálculo de métricas
-            mae = mean_absolute_error(test, val_forecast)
-            rmse = np.sqrt(mean_squared_error(test, val_forecast))
-            r2 = r2_score(test, val_forecast)
+            # Calculate metrics
+            mae = mean_absolute_error(test, val_pred)
+            rmse = np.sqrt(mean_squared_error(test, val_pred))
+            r2 = r2_score(test, val_pred)
             
-            # Intervalo de confiança para modelos não-Prophet
-            if model_type != 'Prophet' or not PROPHET_AVAILABLE:
-                std_error = np.std(test - val_forecast)
-                z_score = {'95': 1.96, '90': 1.645, '80': 1.28}.get(str(confidence_level), 1.96)
-                lower = forecast - z_score * std_error
-                upper = forecast + z_score * std_error
-                
         except Exception as e:
-            print(f"Erro na validação: {str(e)}")
+            print(f"Validation error: {str(e)}")
             mae, rmse, r2 = None, None, None
-            lower, upper = None, None
         
         return {
-            'forecast': forecast,
+            'forecast': forecast_values,
             'lower': lower,
             'upper': upper,
             'mae': mae,
@@ -137,11 +146,11 @@ def generate_forecast(series, forecast_period, freq='M', model_type='AutoARIMA',
         }
         
     except Exception as e:
-        print(f"Erro na previsão: {str(e)}")
+        print(f"Forecast error: {str(e)}")
         return None
 
-def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type='AutoARIMA', confidence_interval=95):
-    """Função principal de análise com múltiplos modelos e métricas"""
+def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type='SARIMAX', confidence_interval=95):
+    """Complete time series analysis function"""
     results = {
         'mean': None,
         'std': None,
@@ -169,22 +178,22 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
     }
     
     try:
-        # Pré-processamento seguro
+        # Pre-processing
         df = df.sort_values(date_col).dropna(subset=[date_col, value_col])
         series = df.set_index(date_col)[value_col].astype(float)
         freq = pd.infer_freq(df[date_col]) or 'M'
         
-        # Estatísticas básicas
+        # Basic statistics
         results.update({
             'mean': series.mean(),
             'std': series.std(),
-            'trend': 'Crescente' if series.pct_change().mean() > 0 else 'Decrescente'
+            'trend': 'Increasing' if series.pct_change().mean() > 0 else 'Decreasing'
         })
         
-        # Teste de estacionariedade corrigido
+        # Stationarity test
         try:
             adf_result = adfuller(series.dropna())
-            if len(adf_result) >= 5:  # Verifica se tem todos os componentes
+            if len(adf_result) >= 5:
                 results['stationarity'].update({
                     'test_statistic': adf_result[0],
                     'p_value': adf_result[1],
@@ -196,13 +205,10 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                     'is_stationary': adf_result[1] <= 0.05,
                     'error': None
                 })
-            else:
-                raise ValueError("Resultado do teste ADF incompleto")
         except Exception as e:
-            results['stationarity']['error'] = f"Erro no teste de estacionariedade: {str(e)}"
-            print(results['stationarity']['error'])
+            results['stationarity']['error'] = f"Stationarity test error: {str(e)}"
         
-        # Decomposição sazonal (apenas se tiver dados suficientes)
+        # Seasonal decomposition
         if len(series) >= 24:
             try:
                 decomposition = seasonal_decompose(
@@ -213,27 +219,27 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                 seasonal_ratio = decomposition.seasonal.std() / decomposition.observed.std()
                 results['has_seasonality'] = seasonal_ratio > 0.1
                 
-                # Plot de decomposição
+                # Decomposition plot
                 decomp_df = pd.DataFrame({
-                    'Observado': decomposition.observed,
-                    'Tendência': decomposition.trend,
-                    'Sazonalidade': decomposition.seasonal,
-                    'Resíduo': decomposition.resid
+                    'Observed': decomposition.observed,
+                    'Trend': decomposition.trend,
+                    'Seasonal': decomposition.seasonal,
+                    'Residual': decomposition.resid
                 }).reset_index()
                 
                 results['decomposition_fig'] = px.line(
-                    decomp_df.melt(id_vars=[date_col], var_name='Componente'),
+                    decomp_df.melt(id_vars=[date_col], var_name='Component'),
                     x=date_col,
                     y='value',
-                    color='Componente',
-                    facet_row='Componente',
+                    color='Component',
+                    facet_row='Component',
                     height=800,
-                    title="Decomposição da Série Temporal"
+                    title="Time Series Decomposition"
                 )
             except Exception as e:
-                print(f"Erro na decomposição: {str(e)}")
+                print(f"Decomposition error: {str(e)}")
         
-        # Previsão
+        # Forecasting
         forecast_result = generate_forecast(
             series, 
             forecast_period, 
@@ -250,7 +256,7 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                 'model_used': forecast_result['model_used']
             })
             
-            # Criação do gráfico de previsão
+            # Forecast plot data
             last_date = df[date_col].iloc[-1]
             future_dates = pd.date_range(
                 start=last_date,
@@ -263,27 +269,28 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                 value_col: forecast_result['forecast'],
                 'lower': forecast_result['lower'],
                 'upper': forecast_result['upper'],
-                'type': 'Previsão'
+                'type': 'Forecast'
             })
             
             results['forecast_df'] = forecast_df
             
+            # Create forecast plot
             original_df = df[[date_col, value_col]].copy()
-            original_df['type'] = 'Original'
+            original_df['type'] = 'Historical'
             
             fig = px.line(
                 original_df,
                 x=date_col,
                 y=value_col,
                 color='type',
-                title=f"Série Temporal com Previsão ({forecast_result['model_used']})"
+                title=f"Time Series Forecast ({forecast_result['model_used']})"
             )
             
             fig.add_scatter(
                 x=forecast_df[date_col],
                 y=forecast_df[value_col],
                 mode='lines',
-                name='Previsão',
+                name='Forecast',
                 line=dict(dash='dot', color='red')
             )
             
@@ -303,12 +310,12 @@ def analyze_time_series(df, date_col, value_col, forecast_period=12, model_type=
                     line=dict(width=0),
                     fill='tonexty',
                     fillcolor='rgba(255,0,0,0.2)',
-                    name=f'Intervalo {confidence_interval}%'
+                    name=f'{confidence_interval}% Confidence'
                 )
             
             results['forecast_fig'] = fig
     
     except Exception as e:
-        print(f"Erro na análise: {str(e)}")
+        print(f"Analysis error: {str(e)}")
     
     return results
